@@ -1,0 +1,19 @@
+# Cattura audio (PortAudio). Su Windows funziona senza compilare nulla.
+sounddevice>=0.4.6
+numpy>=1.24
+
+# Motore locale. Tira dentro ctranslate2 e onnxruntime (per il filtro VAD).
+faster-whisper>=1.0.3
+
+# Serve solo se in config.json imposti "engine": "cloud".
+requests>=2.31
+
+# Punti salienti, motore cloud. Serve se in config.json "summary.engine" e'
+# "cloud", oppure "auto" e la trascrizione supera la soglia di parole.
+# Richiede la variabile d'ambiente ANTHROPIC_API_KEY.
+anthropic>=0.40
+
+# Punti salienti, motore locale: non e' un pacchetto Python. Va installato
+# Ollama (https://ollama.com) e scaricato il modello:
+#     ollama pull qwen2.5:3b
+# Il dialogo avviene via HTTP su localhost:11434, senza SDK aggiuntivi.

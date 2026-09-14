@@ -1,0 +1,31 @@
+{
+  "engine": "local",
+  "language": "it",
+  "local": {
+    "model": "medium",
+    "device": "cpu",
+    "compute_type": "int8",
+    "beam_size": 1,
+    "vad_filter": true
+  },
+  "cloud": {
+    "base_url": "https://api.openai.com/v1",
+    "model": "whisper-1",
+    "api_key_env": "OPENAI_API_KEY",
+    "timeout_sec": 120
+  },
+  "audio": {
+    "device": null,
+    "samplerate": 16000,
+    "blocksize": 1024
+  },
+  "segmentation": {
+    "min_chunk_sec": 8.0,
+    "max_chunk_sec": 25.0,
+    "silence_hold_sec": 0.7,
+    "min_speech_sec": 0.6,
+    "noise_multiplier": 3.0,
+    "absolute_floor": 0.004
+  },
+  "output_dir": "sessioni"
+}
