@@ -437,6 +437,84 @@ _ECO_MODELLO = re.compile(
 )
 
 
+# Parole alfabetiche, accenti italiani compresi.
+_TOKEN_PAROLA = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'’]*")
+# Fine di frase: dopo questi segni la parola seguente torna maiuscola per
+# ragioni grammaticali, non perche' sia un nome proprio.
+_FINE_FRASE = re.compile(r"(?<=[.!?:;])\s+")
+
+
+# Scioglimento di un acronimo fra parentesi: "FOMO (Fear Of Missing Out)".
+# Le maiuscole la' dentro traducono una sigla, non nominano un'entita'.
+_GLOSSA_ACRONIMO = re.compile(r"\b[A-Z]{2,}\s*\(([^)]*)\)")
+
+
+def _candidati_nomi(testo: str) -> list[str]:
+    """I token che si comportano da nome proprio, in ordine di comparsa.
+
+    Il criterio e' la POSIZIONE, non un elenco di parole italiane. Una prima
+    versione raccoglieva tutte le maiuscole e segnalava "Definizione",
+    "Evoluzione", "Sostenibilita'" — parole comuni maiuscole solo perche'
+    aprivano una voce di elenco: sei falsi positivi su sette segnalazioni.
+
+    Quindi: una maiuscola conta solo se NON apre una frase, mentre un
+    acronimo tutto maiuscolo conta sempre, anche in apertura.
+
+    Gli scioglimenti fra parentesi vengono ignorati: su una generazione vera
+    "FOMO (Fear Of Missing Out)" faceva segnalare "Fear", che non e' un
+    fornitore inventato ma la traduzione di una sigla presente nel testo.
+    """
+    # Le glosse si svuotano prima dello spoglio, non si cancellano: cosi' le
+    # posizioni di inizio frase restano quelle del testo originale.
+    testo = _GLOSSA_ACRONIMO.sub(lambda m: m.group().replace(m.group(1), ""), testo)
+    candidati: list[str] = []
+    for riga in testo.splitlines():
+        riga = riga.lstrip("-*• \t")
+        for frase in _FINE_FRASE.split(riga):
+            primo = True
+            for trovato in _TOKEN_PAROLA.finditer(frase):
+                parola = trovato.group()
+                if len(parola) >= 2 and parola.isupper():
+                    candidati.append(parola)
+                elif not primo and len(parola) >= 3 and parola[:1].isupper():
+                    candidati.append(parola)
+                primo = False
+    return candidati
+
+
+def marca_nomi_sospetti(testo: str, trascrizione: str) -> tuple[str, list[str]]:
+    """Segna con [?] i nomi propri che non compaiono nella trascrizione.
+
+    Serve contro un difetto misurato e non eliminabile col prompt: davanti a
+    un passaggio di trascrizione rovinato il modello completa il nome che
+    immagina. Su una telefonata vera ha coniato prima "Targasys" e poi
+    "Infotarga" da un unico "targata" biascicato, come se fossero fornitori
+    reali. Il marcatore non impedisce l'invenzione: la rende visibile prima
+    che qualcuno agisca sul verbale.
+
+    Restituisce il testo marcato e l'elenco dei nomi sospetti.
+    """
+    if not testo.strip() or not trascrizione.strip():
+        return testo, []
+
+    fonte = trascrizione.lower()
+    sospetti = [
+        parola
+        for parola in dict.fromkeys(_candidati_nomi(testo))
+        if parola.lower() not in fonte
+    ]
+
+    marcato = testo
+    for parola in sospetti:
+        # Il lookahead evita di marcare due volte la stessa occorrenza.
+        marcato = re.sub(
+            rf"\b{re.escape(parola)}\b(?!\s*\[\?\])",
+            f"{parola} [?]",
+            marcato,
+        )
+    return marcato, sospetti
+
+
 def pulisci_elenco(testo: str) -> str:
     """Toglie voci vuote, commenti sull'assenza di contenuto e sezioni rimaste
     senza voci.
@@ -502,10 +580,27 @@ class Highlights:
     text: str
     engine: str  # "local" | "cloud"
     detail: str  # descrizione leggibile, finisce nella barra di stato
+    # Nomi propri comparsi nell'uscita ma assenti dalla trascrizione: nel testo
+    # sono marcati con [?]. Vedi marca_nomi_sospetti().
+    sospetti: list[str] = field(default_factory=list)
 
     @property
     def is_cloud(self) -> bool:
         return self.engine == "cloud"
+
+    def avviso_sospetti(self) -> str:
+        """Riga da mettere accanto al verbale quando ci sono nomi da controllare."""
+        if not self.sospetti:
+            return ""
+        elenco = ", ".join(self.sospetti)
+        quanti = (
+            "Un nome non compare" if len(self.sospetti) == 1
+            else f"{len(self.sospetti)} nomi non compaiono"
+        )
+        return (
+            f"[DA CONTROLLARE] {quanti} nella trascrizione e potrebbe essere "
+            f"inventato: {elenco}. Nel testo e' marcato con [?]."
+        )
 
     def banner(self) -> str:
         """Riga di intestazione: deve dire a colpo d'occhio dove e' finito il testo."""
@@ -1599,6 +1694,11 @@ class App(tk.Tk):
                 etichetta, e_cloud = self.summarizer.plan(content)
                 self.after(0, lambda: self._on_highlights_planned(etichetta, e_cloud))
                 risultato = self.summarizer.summarize(content)
+                # Il confronto coi nomi della trascrizione vale per qualsiasi
+                # motore, quindi sta qui e non dentro i singoli motori.
+                risultato.text, risultato.sospetti = marca_nomi_sospetti(
+                    risultato.text, content
+                )
                 self.after(0, lambda: self._on_highlights_ready(risultato))
             except Exception as exc:
                 self.after(0, lambda: self._on_highlights_failed(exc))
@@ -1624,16 +1724,26 @@ class App(tk.Tk):
             self._refresh_buttons()
             return
 
+        avviso = risultato.avviso_sospetti()
         if self.session is not None:
             with open(self.session.transcript_path, "a", encoding="utf-8") as fh:
-                fh.write(f"\n## Punti salienti\n\n_{banner}_\n\n{risultato.text}\n\n")
+                fh.write(f"\n## Punti salienti\n\n_{banner}_\n\n")
+                if avviso:
+                    fh.write(f"_{avviso}_\n\n")
+                fh.write(f"{risultato.text}\n\n")
                 fh.flush()
         self._append("\nPunti salienti\n", "note")
         self._append(f"{banner}\n", "cloud" if risultato.is_cloud else "note")
+        if avviso:
+            self._append(f"{avviso}\n", "cloud")
         self._append(f"{risultato.text}\n\n")
+        quanti = len(risultato.sospetti)
+        coda = f" {quanti} nome da controllare." if quanti == 1 else (
+            f" {quanti} nomi da controllare." if quanti else ""
+        )
         self.status.config(
             text=("Punti salienti generati nel CLOUD." if risultato.is_cloud
-                  else "Punti salienti generati in locale.")
+                  else "Punti salienti generati in locale.") + coda
         )
         self._refresh_buttons()
 

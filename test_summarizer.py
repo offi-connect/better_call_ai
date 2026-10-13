@@ -372,6 +372,93 @@ def test_pulizia() -> None:
     verifica("l'azione vera sopravvive", "Power Automate" in r)
 
 
+def test_nomi_sospetti() -> None:
+    print("\n--- 4b. marcatura dei nomi propri inventati ---")
+
+    # Il caso reale: da un unico "targata" biascicato il modello ha coniato
+    # prima "Targasys" poi "Infotarga", come se fossero fornitori esistenti.
+    trascrizione = (
+        "[00:18:15] i clienti di fatto sono una targata in veicolo per noi.\n"
+        "[00:22:03] poi quello che vede con Power BI, ti fanno statistiche.\n"
+        "[00:31:40] uno come reseller poi vendi la cosa alle officine.\n"
+        "[00:40:12] chiamano sistemi RAG, praticamente alimentano chat.\n"
+        "[00:44:01] mi concordi l'export in CSV, io lo rimporto senza problemi.\n"
+        "[00:51:30] le rigiro a Cristian le slide.\n"
+        "[00:55:18] e' la FOMO, la paura di restare fuori dalla rete.\n"
+    )
+    uscita = (
+        "Decisioni\n"
+        "- Utilizzare il servizio Infotarga per la gestione delle targhe.\n"
+        "Da decidere\n"
+        "- Definizione della politica di visibilita' delle officine.\n"
+        "- Scelta delle funzionalita' da implementare subito.\n"
+        "Azioni\n"
+        "- Rigirare le slide a Cristian.\n"
+        "- Verificare il collegamento con il CSV.\n"
+        "Temi discussi\n"
+        "- Evoluzione verso la diagnostica con sistemi RAG.\n"
+        "- Corsi di formazione su Power BI.\n"
+        "- Sostenibilita' del modello a reseller.\n"
+    )
+    marcato, sospetti = verbale.marca_nomi_sospetti(uscita, trascrizione)
+
+    verifica("il nome inventato e' segnalato", "Infotarga" in sospetti)
+    verifica("nel testo compare marcato", "Infotarga [?]" in marcato)
+    verifica("segnalato una volta sola", sospetti.count("Infotarga") == 1)
+
+    # Le sei parole che il primo euristico sbagliava: comuni, maiuscole solo
+    # perche' aprono una voce di elenco.
+    print("   parole comuni a inizio voce, non piu' confuse con nomi propri:")
+    for comune in ("Definizione", "Scelta", "Evoluzione", "Sostenibilita'", "Rigirare", "Corsi"):
+        verifica(f"{comune} non segnalata", comune not in sospetti)
+
+    print("   nomi e acronimi che SONO nella trascrizione:")
+    for vero in ("Cristian", "CSV", "RAG", "Power", "BI"):
+        verifica(f"{vero} non segnalato", vero not in sospetti)
+
+    print("   casi limite:")
+    verifica("in totale un solo sospetto", len(sospetti) == 1)
+    verifica(
+        "testo vuoto -> nessun sospetto",
+        verbale.marca_nomi_sospetti("", trascrizione) == ("", []),
+    )
+    verifica(
+        "trascrizione vuota -> non marca nulla",
+        verbale.marca_nomi_sospetti(uscita, "")[1] == [],
+    )
+    verifica(
+        "confronto insensibile alle maiuscole",
+        not verbale.marca_nomi_sospetti("- parla con Reseller", trascrizione)[1],
+    )
+    doppio, _ = verbale.marca_nomi_sospetti(
+        "- Infotarga serve. Poi Infotarga di nuovo.", trascrizione
+    )
+    verifica("tutte le occorrenze marcate", doppio.count("[?]") == 2)
+    verifica(
+        "una marcatura non si somma a se stessa",
+        "[?] [?]" not in verbale.marca_nomi_sospetti(doppio, trascrizione)[0],
+    )
+
+    print("   scioglimenti di sigle fra parentesi (caso osservato dal vero):")
+    glossa = "- logiche di FOMO (Fear Of Missing Out) per le officine."
+    _, sosp_glossa = verbale.marca_nomi_sospetti(glossa, trascrizione)
+    verifica("'Fear' non segnalato", "Fear" not in sosp_glossa)
+    verifica("nessuna parola della glossa segnalata", sosp_glossa == [])
+    # Ma una parentesi che NON scioglie una sigla resta sotto esame.
+    _, sosp_paren = verbale.marca_nomi_sospetti(
+        "- il modulo (gestito da Acme) va rifatto.", trascrizione
+    )
+    verifica("un nome in parentesi normale e' ancora segnalato", "Acme" in sosp_paren)
+
+    print("   l'avviso che finisce nel verbale:")
+    uno = verbale.Highlights("x", "cloud", "m", ["Infotarga"])
+    due = verbale.Highlights("x", "cloud", "m", ["Infotarga", "Acme"])
+    nessuno = verbale.Highlights("x", "cloud", "m")
+    verifica("singolare", "Un nome non compare" in uno.avviso_sospetti())
+    verifica("plurale", "2 nomi non compaiono" in due.avviso_sospetti())
+    verifica("senza sospetti nessun avviso", nessuno.avviso_sospetti() == "")
+
+
 def test_banner() -> None:
     print("\n--- 5. il banner dichiara sempre dove e' finito il testo ---")
     locale = verbale.Highlights("x", "local", "qwen2.5:3b").banner()
@@ -418,6 +505,7 @@ def main() -> int:
     test_blocchi()
     test_voci_menu()
     test_pulizia()
+    test_nomi_sospetti()
     test_banner()
     test_scelta()
 
