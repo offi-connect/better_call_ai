@@ -122,6 +122,15 @@ DEFAULT_CONFIG = {
             },
         },
     },
+    "ritrascrizione": {
+        # Motore predefinito del menu: locale, cosi' chi non ha una chiave API
+        # trova comunque la funzione utilizzabile e nulla esce dal PC senza
+        # che sia stato scelto esplicitamente.
+        "motore": "whisper:large-v3",
+        # Oltre questa dimensione l'audio non si manda dentro la richiesta ma
+        # si carica a parte: il limite della richiesta in linea e' 20 MB.
+        "soglia_inline_mb": 15,
+    },
     "output_dir": "sessioni",
 }
 
@@ -983,6 +992,153 @@ class AutoSummarizer:
         return risultato
 
 
+# --------------------------------------------------------------------------- #
+# Ritrascrizione differita
+# --------------------------------------------------------------------------- #
+
+# A sessione finita l'audio e' su disco e il tempo non e' piu' un vincolo:
+# si puo' rifare la trascrizione con un motore piu' accurato di quello che
+# deve stare al passo con la diretta.
+#
+# Misurato su 61 s di dettatura, contro la trascrizione vera di chi parlava
+# (termini chiave azzeccati su 9):
+#   whisper medium    3/9   0,30x tempo reale   locale
+#   whisper large-v3  6/9   0,54x               locale
+#   gemini 3.5 lite   7/9   5,2x (sotto carico) l'audio esce dal PC
+#   gemini 3.8 flash  9/9   6,9x (sotto carico) l'audio esce dal PC
+MOTORI_RITRASCRIZIONE = [
+    ("Gemini 3.8 Flash - remoto, resa massima", "gemini:gemini-3.8-flash"),
+    ("Gemini 3.5 Lite - remoto, piu' economico", "gemini:gemini-3.5-flash-lite"),
+    ("Whisper large-v3 - locale, niente esce dal PC", "whisper:large-v3"),
+    ("Whisper medium - locale, piu' rapido", "whisper:medium"),
+]
+
+ISTRUZIONE_RITRASCRIZIONE = (
+    "Trascrivi fedelmente il parlato di questo audio in italiano.\n"
+    "- Riporta solo le parole pronunciate: non riassumere, non commentare, non "
+    "correggere il contenuto.\n"
+    "- Usa la punteggiatura per rendere leggibile il testo.\n"
+    "- Scrivi correttamente i nomi propri di persona che riconosci.\n"
+    "- Se una parola e' incomprensibile scrivi [incomprensibile] invece di "
+    "indovinare.\n"
+    "- Apri ogni intervento con la marca temporale fra parentesi quadre nel "
+    "formato [hh:mm:ss]. Se senti voci diverse, aggiungi l'etichetta del "
+    "parlante (Parlante 1, Parlante 2) dopo la marca temporale.\n"
+    "Rispondi solo con la trascrizione."
+)
+
+
+def leggi_wav_mono16k(percorso: Path) -> np.ndarray:
+    """Carica un wav come float mono a 16 kHz, convertendo se serve."""
+    with wave.open(str(percorso), "rb") as wf:
+        canali = wf.getnchannels()
+        sr = wf.getframerate()
+        grezzo = wf.readframes(wf.getnframes())
+    campioni = np.frombuffer(grezzo, dtype=np.int16).astype(np.float32) / 32768.0
+    if canali > 1:
+        campioni = campioni.reshape(-1, canali).mean(axis=1)
+    if sr != TARGET_SR:
+        campioni = resample_linear(campioni, sr, TARGET_SR)
+    return campioni
+
+
+def _ritrascrivi_whisper(audio: Path, modello: str, cfg: dict) -> str:
+    from faster_whisper import WhisperModel
+
+    locale = cfg["local"]
+    motore = WhisperModel(
+        modello,
+        device=locale.get("device", "cpu"),
+        compute_type=locale.get("compute_type", "int8"),
+    )
+    segmenti, _ = motore.transcribe(
+        leggi_wav_mono16k(audio),
+        language=cfg.get("language", "it"),
+        beam_size=locale.get("beam_size", 1),
+        vad_filter=locale.get("vad_filter", True),
+        condition_on_previous_text=False,
+    )
+    righe = [
+        f"[{fmt_hms(s.start)}] {s.text.strip()}"
+        for s in segmenti
+        if s.text and s.text.strip()
+    ]
+    return "\n\n".join(righe)
+
+
+def _ritrascrivi_gemini(audio: Path, modello: str, cfg: dict) -> str:
+    import base64
+
+    from google import genai
+
+    gem = cfg["summary"]["cloud"]["gemini"]
+    chiave = os.environ.get(gem.get("api_key_env", "GEMINI_API_KEY"), "").strip()
+    if not chiave:
+        raise RuntimeError(
+            f"Variabile d'ambiente {gem.get('api_key_env', 'GEMINI_API_KEY')} "
+            "non impostata."
+        )
+    client = genai.Client(api_key=chiave)
+
+    byte = audio.read_bytes()
+    limite = float(cfg.get("ritrascrizione", {}).get("soglia_inline_mb", 15))
+    if len(byte) <= limite * 1_000_000:
+        blocco = {
+            "type": "audio",
+            "data": base64.b64encode(byte).decode("ascii"),
+            "mime_type": "audio/wav",
+        }
+    else:
+        # Oltre il limite della richiesta in linea (20 MB comprese le istruzioni)
+        # il file va caricato a parte e citato per riferimento.
+        caricato = client.files.upload(file=str(audio))
+        blocco = {
+            "type": "audio",
+            "uri": caricato.uri,
+            "mime_type": getattr(caricato, "mime_type", None) or "audio/wav",
+        }
+
+    attesa = 8.0
+    ultimo: Exception | None = None
+    for tentativo in range(1, 5):
+        try:
+            interazione = client.interactions.create(
+                model=modello,
+                input=[
+                    {"type": "text", "text": ISTRUZIONE_RITRASCRIZIONE},
+                    blocco,
+                ],
+            )
+            return _testo_gemini(interazione).strip()
+        except Exception as exc:
+            ultimo = exc
+            if tentativo < 4 and GeminiSummarizer._e_temporaneo(exc):
+                time.sleep(attesa)
+                attesa *= 1.6
+                continue
+            raise RuntimeError(GeminiSummarizer._traduci_errore(exc)) from exc
+    raise RuntimeError(GeminiSummarizer._traduci_errore(ultimo or Exception("ignoto")))
+
+
+def ritrascrivi(audio: Path, scelta: str, cfg: dict) -> tuple[str, bool]:
+    """Ritrascrive un audio salvato. Restituisce (testo, l_audio_e_uscito)."""
+    tipo, _, modello = scelta.partition(":")
+    if tipo == "whisper":
+        return _ritrascrivi_whisper(audio, modello, cfg), False
+    if tipo == "gemini":
+        return _ritrascrivi_gemini(audio, modello, cfg), True
+    ammessi = ", ".join(sorted({v.split(":")[0] for _, v in MOTORI_RITRASCRIZIONE}))
+    raise RuntimeError(
+        f"Motore di ritrascrizione sconosciuto: {scelta!r}. Ammessi: {ammessi}."
+    )
+
+
+def nome_file_ritrascrizione(scelta: str) -> str:
+    """verbale_gemini-3.8-flash.md, verbale_whisper-large-v3.md…"""
+    pulito = re.sub(r"[^0-9A-Za-z.-]+", "-", scelta.replace(":", "-")).strip("-")
+    return f"verbale_{pulito}.md"
+
+
 # Voci del menu a tendina: (etichetta mostrata, valore in config.json).
 # Restano tre: "remoto" e' remoto a prescindere dal fornitore, che si scegli con
 # summary.cloud.provider in config.json.
@@ -1214,7 +1370,7 @@ class RecordingSession:
 # --------------------------------------------------------------------------- #
 
 import tkinter as tk  # noqa: E402
-from tkinter import messagebox, ttk  # noqa: E402
+from tkinter import filedialog, messagebox, ttk  # noqa: E402
 
 # Palette azzurra. Tenuta in un posto solo: i widget non hanno colori scritti
 # a mano, cosi' cambiare tinta e' una modifica sola.
@@ -1244,8 +1400,12 @@ class App(tk.Tk):
         self.summarizer: LocalSummarizer | CloudSummarizer | AutoSummarizer | None = None
         self.model_ready = False
         self.generating_highlights = False
-        self._hl_inizio: float | None = None  # avvio dell'elaborazione, per il cronometro
-        self._hl_etichetta = ""
+        self.ritrascrivendo = False
+        # Trascrizione da usare per i punti salienti: una ritrascrizione
+        # riuscita prende il posto dell'originale, che resta su disco.
+        self.trascrizione_attiva: Path | None = None
+        self._op_inizio: float | None = None  # avvio dell'operazione, per il cronometro
+        self._op_etichetta = ""
         self.state_name = "idle"  # idle | recording | paused | finishing
         self.peak = 0.0
 
@@ -1405,6 +1565,40 @@ class App(tk.Tk):
             )
         )
         self._check_summary_engine()
+
+        # Ritrascrizione differita: a sessione finita l'audio e' su disco e si
+        # puo' rifare il lavoro con un motore piu' accurato della diretta.
+        retrans_row = ttk.Frame(self)
+        retrans_row.pack(side="bottom", fill="x", **pad)
+        ttk.Label(retrans_row, text="Ritrascrivi l'audio con").pack(side="left")
+        self.retrans_var = tk.StringVar()
+        self.retrans_box = ttk.Combobox(
+            retrans_row,
+            textvariable=self.retrans_var,
+            state="readonly",
+            width=44,
+            values=[etichetta for etichetta, _ in MOTORI_RITRASCRIZIONE],
+        )
+        self.retrans_box.pack(side="left", padx=(6, 10))
+        self.retrans_box.bind(
+            "<<ComboboxSelected>>", lambda _e: self._on_retrans_changed()
+        )
+        self.btn_retrans = ttk.Button(
+            retrans_row, text="Ritrascrivi", command=self.ritrascrivi_sessione
+        )
+        self.btn_retrans.pack(side="left")
+        self.retrans_status = ttk.Label(
+            retrans_row, text="", foreground=COLORI["testo_tenue"]
+        )
+        self.retrans_status.pack(side="left", padx=(10, 0))
+
+        motore_scelto = self.cfg["ritrascrizione"].get("motore", "whisper:large-v3")
+        self.retrans_var.set(
+            next(
+                (e for e, v in MOTORI_RITRASCRIZIONE if v == motore_scelto),
+                MOTORI_RITRASCRIZIONE[0][0],
+            )
+        )
 
         buttons = ttk.Frame(self)
         buttons.pack(side="bottom", fill="x", **pad)
@@ -1610,20 +1804,20 @@ class App(tk.Tk):
         # Il sommarizzatore e' costruito una volta sola e messo in cache: va
         # buttato, altrimenti la scelta nuova non ha effetto.
         self.summarizer = None
-        self._salva_preferenza_motore(valore)
+        self._salva_preferenza("summary", "engine", valore)
         self._check_summary_engine()
 
-    def _salva_preferenza_motore(self, valore: str) -> None:
-        """Scrive la scelta in config.json, cosi' sopravvive al riavvio."""
+    def _salva_preferenza(self, sezione: str, chiave: str, valore: str) -> None:
+        """Scrive una scelta dei menu in config.json, cosi' sopravvive al riavvio."""
         try:
             dati = (
                 json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
                 if CONFIG_PATH.exists()
                 else {}
             )
-            if not isinstance(dati.get("summary"), dict):
-                dati["summary"] = {}
-            dati["summary"]["engine"] = valore
+            if not isinstance(dati.get(sezione), dict):
+                dati[sezione] = {}
+            dati[sezione][chiave] = valore
             CONFIG_PATH.write_text(
                 json.dumps(dati, indent=2, ensure_ascii=False), encoding="utf-8"
             )
@@ -1686,6 +1880,126 @@ class App(tk.Tk):
             text=testo, foreground=COLORI["ok"] if ok else COLORI["allarme"]
         )
 
+    # -- ritrascrizione differita ------------------------------------------ #
+
+    def _on_retrans_changed(self) -> None:
+        etichetta = self.retrans_var.get()
+        valore = next(
+            (v for e, v in MOTORI_RITRASCRIZIONE if e == etichetta),
+            MOTORI_RITRASCRIZIONE[0][1],
+        )
+        self.cfg["ritrascrizione"]["motore"] = valore
+        self._salva_preferenza("ritrascrizione", "motore", valore)
+        self.retrans_status.config(text="", foreground=COLORI["testo_tenue"])
+
+    def _audio_da_ritrascrivere(self) -> Path | None:
+        """L'audio della sessione corrente, o una cartella scelta dall'utente.
+
+        Senza la seconda possibilita' si potrebbe ritrascrivere solo cio' che
+        si e' registrato senza mai chiudere l'applicazione, che e' proprio il
+        caso meno interessante: le registrazioni da rifare sono quelle vecchie.
+        """
+        if self.session is not None and self.session.audio_path.exists():
+            return self.session.audio_path
+
+        iniziale = APP_DIR / self.cfg["output_dir"]
+        scelta = filedialog.askdirectory(
+            title="Scegli la cartella della sessione da ritrascrivere",
+            initialdir=str(iniziale if iniziale.exists() else APP_DIR),
+        )
+        if not scelta:
+            return None
+        audio = Path(scelta) / "audio.wav"
+        if not audio.exists():
+            messagebox.showerror(
+                "Audio non trovato",
+                f"In {scelta} non c'e' nessun audio.wav.",
+            )
+            return None
+        return audio
+
+    def ritrascrivi_sessione(self) -> None:
+        if self.ritrascrivendo or self.generating_highlights:
+            return
+        audio = self._audio_da_ritrascrivere()
+        if audio is None:
+            return
+
+        etichetta = self.retrans_var.get()
+        scelta = next(
+            (v for e, v in MOTORI_RITRASCRIZIONE if e == etichetta),
+            MOTORI_RITRASCRIZIONE[0][1],
+        )
+        e_remoto = scelta.startswith("gemini")
+        secondi = max(audio.stat().st_size - 44, 0) / (TARGET_SR * 2)
+
+        if e_remoto and not messagebox.askokcancel(
+            "L'audio esce dal PC",
+            f"Stai per inviare {secondi / 60:.0f} minuti di audio a un servizio "
+            "esterno: non il testo, la registrazione.\n\n"
+            "Sul piano gratuito Google puo' usare i contenuti per addestrare i "
+            "propri modelli. Se nella riunione ci sono altre persone, tienine "
+            "conto.\n\nProcedere?",
+        ):
+            return
+
+        self.ritrascrivendo = True
+        self._op_inizio = time.monotonic()
+        self._op_etichetta = f"{'REMOTO - ' if e_remoto else ''}ritrascrivo con {scelta}"
+        self._refresh_buttons()
+        self._append(
+            f"\nRitrascrivo {audio.parent.name} ({secondi / 60:.0f} min) "
+            f"con {scelta}…\n",
+            "cloud" if e_remoto else "meta",
+        )
+        self._tick_operazione()
+
+        def work():
+            try:
+                testo, uscito = ritrascrivi(audio, scelta, self.cfg)
+                destinazione = audio.parent / nome_file_ritrascrizione(scelta)
+                intestazione = (
+                    f"# Ritrascrizione — {audio.parent.name}\n\n"
+                    f"- Motore: {scelta}\n"
+                    f"- Audio: {audio.name} ({secondi / 60:.1f} minuti)\n"
+                    + ("- L'audio e' stato inviato a un servizio esterno.\n" if uscito
+                       else "- Elaborato in locale: nessun dato ha lasciato questo PC.\n")
+                    + "\n## Trascrizione\n\n"
+                )
+                destinazione.write_text(intestazione + testo + "\n", encoding="utf-8")
+                self.after(0, lambda: self._on_retrans_ready(destinazione, testo, uscito))
+            except Exception as exc:
+                self.after(0, lambda: self._on_retrans_failed(exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_retrans_ready(self, percorso: Path, testo: str, uscito: bool) -> None:
+        self.ritrascrivendo = False
+        durata = self._durata_operazione()
+        # La ritrascrizione diventa la fonte per i punti salienti; l'originale
+        # resta sul disco, non viene sovrascritto.
+        self.trascrizione_attiva = percorso
+        parole = len(testo.split())
+        self._append(f"Ritrascrizione salvata in {percorso.name}\n", "meta")
+        self._append(f"{testo}\n\n")
+        self.status.config(
+            text=f"Ritrascritto{durata}: {parole} parole in {percorso.name}. "
+            "I punti salienti useranno questa versione."
+        )
+        self.retrans_status.config(
+            text=f"attiva: {percorso.name}", foreground=COLORI["ok"]
+        )
+        self._refresh_buttons()
+
+    def _on_retrans_failed(self, exc: Exception) -> None:
+        self.ritrascrivendo = False
+        durata = self._durata_operazione()
+        self.status.config(text=f"Ritrascrizione non riuscita{durata}: {exc}")
+        self._append(f"Ritrascrizione non riuscita: {exc}\n\n", "cloud")
+        self.retrans_status.config(text="non riuscita", foreground=COLORI["allarme"])
+        messagebox.showerror("Ritrascrizione non riuscita", str(exc))
+        self._refresh_buttons()
+
     def generate_highlights(self) -> None:
         if self.generating_highlights:
             return
@@ -1698,11 +2012,11 @@ class App(tk.Tk):
         # motore remoto l'attesa e' di minuti: con il solo testo nella barra di
         # stato in fondo alla finestra sembra che il clic non abbia fatto nulla.
         self.generating_highlights = True
-        self._hl_inizio = time.monotonic()
-        self._hl_etichetta = "Scelgo il motore"
+        self._op_inizio = time.monotonic()
+        self._op_etichetta = "Scelgo il motore"
         self._refresh_buttons()
         self._append("\nGenero i punti salienti…\n", "meta")
-        self._tick_highlights()
+        self._tick_operazione()
 
         def work():
             try:
@@ -1725,41 +2039,43 @@ class App(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _tick_highlights(self) -> None:
+    def _tick_operazione(self) -> None:
         """Cronometro che scorre finche' il motore sta elaborando.
 
         Serve a distinguere "sta lavorando" da "non e' partito niente": senza
         un numero che cambia, tre minuti di attesa sono indistinguibili da un
         clic andato perso.
         """
-        if not self.generating_highlights or self._hl_inizio is None:
+        if not (self.generating_highlights or self.ritrascrivendo):
             return
-        trascorso = time.monotonic() - self._hl_inizio
+        if self._op_inizio is None:
+            return
+        trascorso = time.monotonic() - self._op_inizio
         puntini = "." * (1 + int(trascorso * 2) % 3)
         self.status.config(
-            text=f"{self._hl_etichetta}{puntini}  {fmt_hms(trascorso)}  "
+            text=f"{self._op_etichetta}{puntini}  {fmt_hms(trascorso)}  "
             "(il pulsante torna attivo a elaborazione finita)"
         )
-        self.after(400, self._tick_highlights)
+        self.after(400, self._tick_operazione)
 
     def _on_highlights_planned(self, etichetta: str, e_cloud: bool) -> None:
         prefisso = "CLOUD - " if e_cloud else ""
-        self._hl_etichetta = f"{prefisso}{etichetta}"
+        self._op_etichetta = f"{prefisso}{etichetta}"
         # Anche nella finestra, non solo nella barra: se il testo sta per
         # uscire dal PC deve vedersi dove l'utente sta leggendo.
         self._append(f"{etichetta}\n", "cloud" if e_cloud else "meta")
 
-    def _durata_highlights(self) -> str:
+    def _durata_operazione(self) -> str:
         """Quanto e' durata l'elaborazione, da aggiungere al messaggio finale."""
-        if self._hl_inizio is None:
+        if self._op_inizio is None:
             return ""
-        durata = fmt_hms(time.monotonic() - self._hl_inizio)
-        self._hl_inizio = None
+        durata = fmt_hms(time.monotonic() - self._op_inizio)
+        self._op_inizio = None
         return f" in {durata}"
 
     def _on_highlights_ready(self, risultato: Highlights) -> None:
         self.generating_highlights = False
-        durata = self._durata_highlights()
+        durata = self._durata_operazione()
         banner = risultato.banner()
 
         # Dopo la ripulitura puo' non restare niente: e' il caso di una
@@ -1800,7 +2116,7 @@ class App(tk.Tk):
 
     def _on_highlights_failed(self, exc: Exception) -> None:
         self.generating_highlights = False
-        durata = self._durata_highlights()
+        durata = self._durata_operazione()
         self.status.config(text=f"Punti salienti non generati{durata}: {exc}")
         # Anche nella finestra: chi guarda il testo deve capire che il "Genero…"
         # di prima e' finito male, non che sta ancora lavorando.
@@ -1911,6 +2227,10 @@ class App(tk.Tk):
         self.text.see("end")
 
     def _current_transcript_text(self) -> str:
+        # Una ritrascrizione riuscita e' la versione migliore che abbiamo:
+        # i punti salienti devono partire da quella, non dall'originale.
+        if self.trascrizione_attiva is not None and self.trascrizione_attiva.exists():
+            return self.trascrizione_attiva.read_text(encoding="utf-8")
         if self.session is not None and self.session.transcript_path.exists():
             return self.session.transcript_path.read_text(encoding="utf-8")
         return self.text.get("1.0", "end").strip()
@@ -1929,11 +2249,25 @@ class App(tk.Tk):
         has_file = self.session is not None and self.session.transcript_path.exists()
         self.btn_copy.config(state="normal" if has_file else "disabled")
         self.btn_open.config(state="normal" if has_file else "disabled")
+
+        # La ritrascrizione non ha bisogno di una sessione aperta: senza, chiede
+        # all'utente quale cartella ritrascrivere. Resta bloccata solo mentre
+        # si registra, o mentre un'altra operazione e' in corso.
+        occupato = self.generating_highlights or self.ritrascrivendo
+        self.btn_retrans.config(
+            text="Ritrascrivo…" if self.ritrascrivendo else "Ritrascrivi",
+            state="disabled" if (recording or occupato) else "normal",
+        )
+        self.retrans_box.config(state="disabled" if occupato else "readonly")
+        self.summary_engine_box.config(state="disabled" if occupato else "readonly")
         # L'etichetta del pulsante e' il riscontro piu' immediato: il controllo
         # che hai premuto cambia da solo, senza dover cercare la barra di stato.
+        pronto_salienti = has_file or (
+            self.trascrizione_attiva is not None and self.trascrizione_attiva.exists()
+        )
         self.btn_highlights.config(
             text="Genero…" if self.generating_highlights else "Punti salienti",
-            state="normal" if (has_file and not self.generating_highlights) else "disabled",
+            state="normal" if (pronto_salienti and not occupato) else "disabled",
         )
 
     def _on_close(self) -> None:

@@ -30,5 +30,8 @@
   "output_dir": "sessioni",
   "summary": {
     "engine": "cloud"
+  },
+  "ritrascrizione": {
+    "motore": "gemini:gemini-3.8-flash"
   }
 }

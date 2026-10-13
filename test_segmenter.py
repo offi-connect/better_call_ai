@@ -3,7 +3,10 @@ import sys, types
 import numpy as np
 
 # Stub di tkinter: nel container non esiste, ma serve solo alla GUI.
-for name in ("tkinter", "tkinter.ttk", "tkinter.messagebox"):
+# L'elenco dei sottomoduli deve coprire tutto cio' che verbale.py importa:
+# aggiungendo un "from tkinter import X" senza toccare questa riga, i test
+# del segmentatore si rompono con un ImportError che non c'entra con loro.
+for name in ("tkinter", "tkinter.ttk", "tkinter.messagebox", "tkinter.filedialog"):
     mod = types.ModuleType(name)
     sys.modules[name] = mod
 sys.modules["tkinter"].Tk = object
@@ -12,6 +15,7 @@ sys.modules["tkinter"].Canvas = object
 sys.modules["tkinter"].StringVar = object
 sys.modules["tkinter"].ttk = sys.modules["tkinter.ttk"]
 sys.modules["tkinter"].messagebox = sys.modules["tkinter.messagebox"]
+sys.modules["tkinter"].filedialog = sys.modules["tkinter.filedialog"]
 
 from verbale import Segmenter, TARGET_SR, resample_linear, fmt_hms  # noqa: E402
 

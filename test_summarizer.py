@@ -12,10 +12,15 @@ from __future__ import annotations
 import os
 import sys
 import types
+from pathlib import Path
 from unittest import mock
 
 # Stub di tkinter: serve solo a rendere importabile verbale.py senza display.
-for nome in ("tkinter", "tkinter.ttk", "tkinter.messagebox", "tkinter.scrolledtext"):
+# L'elenco deve coprire ogni sottomodulo importato da verbale.py.
+for nome in (
+    "tkinter", "tkinter.ttk", "tkinter.messagebox",
+    "tkinter.scrolledtext", "tkinter.filedialog",
+):
     modulo = types.ModuleType(nome)
     modulo.__getattr__ = lambda _n: mock.MagicMock()
     sys.modules.setdefault(nome, modulo)
@@ -459,6 +464,86 @@ def test_nomi_sospetti() -> None:
     verifica("senza sospetti nessun avviso", nessuno.avviso_sospetti() == "")
 
 
+def test_ritrascrizione() -> None:
+    print("\n--- 4c. ritrascrizione differita ---")
+    cfg = verbale.load_config()
+    valori = [v for _, v in verbale.MOTORI_RITRASCRIZIONE]
+
+    verifica("quattro motori nel menu", len(verbale.MOTORI_RITRASCRIZIONE) == 4)
+    verifica("nessun valore duplicato", len(set(valori)) == len(valori))
+    verifica(
+        "il predefinito e' fra le voci",
+        cfg["ritrascrizione"]["motore"] in valori,
+    )
+    # Il predefinito deve essere locale: un menu che manda l'audio a un
+    # servizio esterno senza una scelta esplicita e' una trappola.
+    verifica(
+        "il predefinito e' locale",
+        verbale.DEFAULT_CONFIG["ritrascrizione"]["motore"].startswith("whisper"),
+    )
+    verifica(
+        "ogni valore ha la forma tipo:modello",
+        all(len(v.split(":")) == 2 and all(v.split(":")) for v in valori),
+    )
+    verifica(
+        "i tipi sono solo whisper e gemini",
+        {v.split(":")[0] for v in valori} == {"whisper", "gemini"},
+    )
+
+    print("   nomi dei file prodotti:")
+    nomi = [verbale.nome_file_ritrascrizione(v) for v in valori]
+    for valore, nome in zip(valori, nomi):
+        print(f"     {valore:30s} -> {nome}")
+    verifica("tutti distinti", len(set(nomi)) == len(nomi))
+    verifica("nessuno sovrascrive verbale.md", "verbale.md" not in nomi)
+    vietati = set('<>:"/\\|?*')
+    verifica(
+        "nessun carattere vietato su Windows",
+        all(not set(n) & vietati for n in nomi),
+    )
+
+    try:
+        verbale.ritrascrivi(Path("x.wav"), "inesistente:1", cfg)
+        verifica("motore ignoto rifiutato", False)
+    except RuntimeError as exc:
+        verifica("motore ignoto rifiutato con spiegazione", "sconosciuto" in str(exc))
+    except Exception as exc:
+        verifica(f"motore ignoto -> RuntimeError, non {type(exc).__name__}", False)
+
+    print("   lettura del wav (mono, stereo, ricampionato):")
+    import tempfile
+    import wave as _wave
+
+    def scrivi(percorso, canali, sr, campioni):
+        with _wave.open(str(percorso), "wb") as wf:
+            wf.setnchannels(canali)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(campioni.astype("<i2").tobytes())
+
+    import numpy as _np
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        uno = (_np.ones(verbale.TARGET_SR) * 1000)
+        scrivi(base / "mono.wav", 1, verbale.TARGET_SR, uno)
+        letto = verbale.leggi_wav_mono16k(base / "mono.wav")
+        verifica("mono 16k: un secondo resta un secondo", len(letto) == verbale.TARGET_SR)
+        verifica("ampiezza normalizzata sotto 1", float(_np.max(_np.abs(letto))) < 1.0)
+
+        stereo = _np.repeat(uno, 2)
+        scrivi(base / "stereo.wav", 2, verbale.TARGET_SR, stereo)
+        letto = verbale.leggi_wav_mono16k(base / "stereo.wav")
+        verifica("stereo ridotto a mono", len(letto) == verbale.TARGET_SR)
+
+        scrivi(base / "48k.wav", 1, 48000, _np.ones(48000) * 1000)
+        letto = verbale.leggi_wav_mono16k(base / "48k.wav")
+        verifica(
+            "48 kHz ricampionato a 16 kHz",
+            abs(len(letto) - verbale.TARGET_SR) <= 1,
+        )
+
+
 def test_banner() -> None:
     print("\n--- 5. il banner dichiara sempre dove e' finito il testo ---")
     locale = verbale.Highlights("x", "local", "qwen2.5:3b").banner()
@@ -506,6 +591,7 @@ def main() -> int:
     test_voci_menu()
     test_pulizia()
     test_nomi_sospetti()
+    test_ritrascrizione()
     test_banner()
     test_scelta()
 
