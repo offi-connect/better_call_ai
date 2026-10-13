@@ -41,12 +41,24 @@ DEFAULT_CONFIG = {
     "engine": "local",  # "local" | "cloud"
     "language": "it",
     "local": {
-        # Misurato su 120s di telefonata vera (i7-1165G7, cpu/int8):
-        # small 0,17x tempo reale, medium 0,53x, large-v3 0,89x.
-        # medium tiene il passo con margine e capisce frasi che small perde
-        # ("ganci traino" contro "canci trinos"). large-v3 e' piu' accurato
-        # ancora ma con l'11% di margine non e' sicuro per la diretta.
-        "model": "medium",  # tiny | base | small | medium | large-v3
+        # Due misure sulla stessa macchina (i7-1165G7, cpu/int8), su materiale
+        # diverso, perche' il margine dipende da cosa si registra:
+        #
+        #   120s di telefonata in vivavoce, due voci accavallate:
+        #     small 0,17x tempo reale, medium 0,53x, large-v3 0,89x
+        #   61s di dettatura a microfono vicino, una voce:
+        #     medium 0,30x, large-v3 0,54x
+        #
+        # Sulla stessa dettatura, contro la trascrizione vera fornita da chi
+        # parlava, medium ha azzeccato 3 termini chiave su 9 e large-v3 sei:
+        # medium rendeva "hardware" come "arbero", "preventivo" scompariva,
+        # "varie voci" diventava "varie cucci". large-v3 li recupera tutti tre.
+        #
+        # Quindi large-v3, che raddoppia la resa restando sotto il tempo reale.
+        # Attenzione: su registrazioni difficili il suo margine scende verso
+        # 0,9x, e se la trascrizione in diretta non tenesse il passo la coda dei
+        # blocchi crescerebbe. In quel caso si scende a medium.
+        "model": "large-v3",  # tiny | base | small | medium | large-v3
         "device": "cpu",
         "compute_type": "int8",
         "beam_size": 1,
