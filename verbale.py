@@ -122,6 +122,10 @@ DEFAULT_CONFIG = {
             },
         },
     },
+    "interfaccia": {
+        # Chiave di TEMI. Si cambia dal menu a tendina nella finestra.
+        "tema": "azzurro",
+    },
     "ritrascrizione": {
         # Motore predefinito del menu: locale, cosi' chi non ha una chiave API
         # trova comunque la funzione utilizzabile e nulla esce dal PC senza
@@ -1372,23 +1376,96 @@ class RecordingSession:
 import tkinter as tk  # noqa: E402
 from tkinter import filedialog, messagebox, ttk  # noqa: E402
 
-# Palette azzurra. Tenuta in un posto solo: i widget non hanno colori scritti
-# a mano, cosi' cambiare tinta e' una modifica sola.
-COLORI = {
-    "sfondo": "#EAF3FA",       # fondo della finestra
-    "superficie": "#FFFFFF",   # aree di contenuto (testo, campi)
-    "bordo": "#B7D5EA",
-    "blu": "#1F6FB2",          # accento principale
-    "blu_vivo": "#2A85CE",     # accento sotto il mouse
-    "blu_scuro": "#0E3F63",    # accento premuto, fondo del vumetro
-    "blu_chiaro": "#D3E7F5",   # selezione
-    "testo": "#16394F",
-    "testo_tenue": "#5B7B90",
-    "spento": "#C9DCEA",       # controlli disabilitati
-    "spento_testo": "#8FAEC4",
-    "ok": "#1B7A4B",
-    "allarme": "#B03A2E",
+# I ruoli dei colori, non le tinte: sono gli stessi in ogni tema, cosi' un
+# widget non sa di che colore e' e cambiare tema non lo tocca.
+#
+#   sfondo          fondo della finestra
+#   superficie      aree di contenuto (riquadro di testo, campi)
+#   bordo           contorno dei campi
+#   accento         colore dei pulsanti e della voce attiva
+#   testo_accento   testo sopra l'accento. Ruolo a parte perche' dipende dal
+#                   tema: bianco sul nero dello Sports, bruno scuro
+#                   sull'arancione del 1979. Usare "superficie" dava 3,01 di
+#                   contrasto su quell'arancione, sotto il minimo leggibile.
+#   accento_vivo    accento sotto il mouse. Dove il testo del pulsante e'
+#                   chiaro questo va piu' SCURO dell'accento, non piu'
+#                   chiaro: schiarendolo il testo bianco perde contrasto.
+#   accento_scuro   accento del pulsante premuto. Deve restare leggibile con
+#                   testo_accento sopra.
+#   vumetro         fondo scuro del vumetro. Ruolo separato da accento_scuro:
+#                   usare lo stesso valore per entrambi mandava il tema 1979
+#                   a 1,45 di contrasto, bruno scuro su blu notte.
+#   selezione       sfondo del testo selezionato
+#   testo           testo normale
+#   testo_tenue     didascalie e marche temporali
+#   spento          controlli disabilitati
+#   spento_testo    testo dei controlli disabilitati
+#   ok / allarme    esiti positivi e negativi (restano verde e rosso: sono
+#                   informazione, non decorazione)
+TEMI: dict[str, dict[str, str]] = {
+    "azzurro": {
+        "sfondo": "#EAF3FA", "superficie": "#FFFFFF", "bordo": "#B7D5EA",
+        "accento": "#1F6FB2", "testo_accento": "#FFFFFF",
+        "accento_vivo": "#18578C",
+        "accento_scuro": "#0E3F63", "vumetro": "#0E3F63",
+        "selezione": "#D3E7F5",
+        "testo": "#16394F", "testo_tenue": "#5B7B90",
+        "spento": "#C9DCEA", "spento_testo": "#6F8DA7",
+        "ok": "#1B7A4B", "allarme": "#B03A2E",
+    },
+    # Il Walkman originale del 1979: scocca blu, frontalino argento,
+    # arancione solo dove si preme.
+    "tps-l2": {
+        "sfondo": "#C6CBD0", "superficie": "#E8EDF1", "bordo": "#9BA3AB",
+        # Arancione bruciato invece del fluo: l'arancione acceso sta al centro
+        # della scala di luminanza, dove ne' il bianco ne' il bruno scuro
+        # arrivano a 4,5 di contrasto. Scurirlo risolve la causa invece del
+        # sintomo, e per un apparecchio del 1979 e' anche piu' fedele.
+        "accento": "#B2430E", "testo_accento": "#FFFFFF",
+        "accento_vivo": "#8F350B",
+        # Il blu notte resta dove serve davvero, cioe' sotto il vumetro.
+        "accento_scuro": "#732908", "vumetro": "#26374A",
+        "selezione": "#F5CBB3",
+        "testo": "#26374A", "testo_tenue": "#51677A",
+        "spento": "#AFB6BC", "spento_testo": "#646C73",
+        "ok": "#2F6B46", "allarme": "#A8321F",
+    },
+    # Lo Sports giallo gommato del 1984: massimo contrasto, tasti neri.
+    "sports": {
+        "sfondo": "#F2C009", "superficie": "#FFFFFF", "bordo": "#262322",
+        "accento": "#262322", "testo_accento": "#F2C009",
+        "accento_vivo": "#3D3A37",
+        "accento_scuro": "#141211", "vumetro": "#141211",
+        "selezione": "#FDE9A0",
+        "testo": "#262322", "testo_tenue": "#5F5A52",
+        "spento": "#C9A408", "spento_testo": "#4A3D02",
+        # Rosso scurito: su giallo il #D93A2B dava 2,68 di contrasto.
+        "ok": "#1F6B3A", "allarme": "#99231A",
+    },
+    # Il WM-EX di meta' anni '90: alluminio spazzolato e display azzurrino.
+    "wm-ex": {
+        "sfondo": "#CFD4D8", "superficie": "#F4F6F7", "bordo": "#AEB5BB",
+        "accento": "#1F6FB2", "testo_accento": "#FFFFFF",
+        "accento_vivo": "#18578C",
+        "accento_scuro": "#15547F", "vumetro": "#123A52",
+        "selezione": "#9FBFD4",
+        "testo": "#3A4249", "testo_tenue": "#5D656B",
+        "spento": "#BEC4CA", "spento_testo": "#6B7378",
+        "ok": "#1B6B47", "allarme": "#A03A2E",
+    },
 }
+
+# Voci del menu: (etichetta mostrata, chiave in TEMI).
+TEMI_INTERFACCIA = [
+    ("Azzurro", "azzurro"),
+    ("Walkman TPS-L2, 1979 - blu e argento", "tps-l2"),
+    ("Walkman Sports, 1984 - giallo e nero", "sports"),
+    ("Walkman WM-EX, 1995 - alluminio", "wm-ex"),
+]
+
+# Palette in uso. I widget leggono da qui, quindi cambiare tema significa
+# sostituire il contenuto di questo dizionario e ridipingere.
+COLORI: dict[str, str] = dict(TEMI["azzurro"])
 
 
 class App(tk.Tk):
@@ -1443,10 +1520,10 @@ class App(tk.Tk):
         stile.configure("TLabel", background=c["sfondo"], foreground=c["testo"])
         stile.configure(
             "TButton",
-            background=c["blu"],
-            foreground=c["superficie"],
-            bordercolor=c["blu"],
-            focuscolor=c["blu"],
+            background=c["accento"],
+            foreground=c["testo_accento"],
+            bordercolor=c["accento"],
+            focuscolor=c["accento"],
             relief="flat",
             padding=(12, 6),
         )
@@ -1454,8 +1531,8 @@ class App(tk.Tk):
             "TButton",
             background=[
                 ("disabled", c["spento"]),
-                ("pressed", c["blu_scuro"]),
-                ("active", c["blu_vivo"]),
+                ("pressed", c["accento_scuro"]),
+                ("active", c["accento_vivo"]),
             ],
             foreground=[("disabled", c["spento_testo"])],
             bordercolor=[("disabled", c["spento"])],
@@ -1465,42 +1542,83 @@ class App(tk.Tk):
             fieldbackground=c["superficie"],
             background=c["superficie"],
             foreground=c["testo"],
-            arrowcolor=c["blu"],
+            arrowcolor=c["accento"],
             bordercolor=c["bordo"],
-            selectbackground=c["blu_chiaro"],
+            selectbackground=c["selezione"],
             selectforeground=c["testo"],
             padding=4,
         )
         stile.map(
             "TCombobox",
             fieldbackground=[("readonly", c["superficie"])],
-            bordercolor=[("focus", c["blu"])],
+            bordercolor=[("focus", c["accento"])],
         )
         stile.configure(
             "TEntry",
             fieldbackground=c["superficie"],
             foreground=c["testo"],
             bordercolor=c["bordo"],
-            insertcolor=c["blu"],
+            insertcolor=c["accento"],
             padding=4,
         )
-        stile.map("TEntry", bordercolor=[("focus", c["blu"])])
+        stile.map("TEntry", bordercolor=[("focus", c["accento"])])
         stile.configure(
             "TScrollbar",
-            background=c["blu_chiaro"],
+            background=c["selezione"],
             troughcolor=c["sfondo"],
             bordercolor=c["sfondo"],
-            arrowcolor=c["blu"],
+            arrowcolor=c["accento"],
         )
 
         # La tendina aperta della Combobox e' una Listbox Tk, non un widget ttk:
         # si colora solo per opzioni.
         self.option_add("*TCombobox*Listbox.background", c["superficie"])
         self.option_add("*TCombobox*Listbox.foreground", c["testo"])
-        self.option_add("*TCombobox*Listbox.selectBackground", c["blu"])
+        self.option_add("*TCombobox*Listbox.selectBackground", c["accento"])
         self.option_add("*TCombobox*Listbox.selectForeground", c["superficie"])
 
+    def _ridipingi(self) -> None:
+        """Riapplica la palette ai widget che non sono ttk.
+
+        I widget ttk prendono i colori dallo stile, quindi _applica_tema() basta
+        per loro. Canvas, Text e le etichette con colore esplicito invece lo
+        leggono una volta sola alla creazione: senza questo metodo, cambiare
+        tema lascerebbe il riquadro di testo e il vumetro del tema precedente.
+        """
+        self._applica_tema()
+        c = COLORI
+        self.meter.config(bg=c["vumetro"])
+        self.text.config(
+            bg=c["superficie"], fg=c["testo"],
+            insertbackground=c["accento"],
+            selectbackground=c["selezione"], selectforeground=c["accento_scuro"],
+            highlightbackground=c["bordo"], highlightcolor=c["bordo"],
+        )
+        self.text.tag_configure("ts", foreground=c["testo_tenue"])
+        self.text.tag_configure("note", foreground=c["accento"])
+        self.text.tag_configure("meta", foreground=c["testo_tenue"])
+        self.engine_label.config(foreground=c["testo_tenue"])
+        # Gli indicatori di stato si ridipingono da soli alla prossima verifica,
+        # ma se mostrano qualcosa adesso va aggiornato subito.
+        self._check_summary_engine()
+
+    def _on_tema_changed(self) -> None:
+        etichetta = self.tema_var.get()
+        chiave = next(
+            (v for e, v in TEMI_INTERFACCIA if e == etichetta), "azzurro"
+        )
+        COLORI.clear()
+        COLORI.update(TEMI[chiave])
+        self.cfg["interfaccia"]["tema"] = chiave
+        self._salva_preferenza("interfaccia", "tema", chiave)
+        self._ridipingi()
+        self.status.config(text=f"Interfaccia: {etichetta}.")
+
     def _build_ui(self) -> None:
+        COLORI.clear()
+        COLORI.update(
+            TEMI.get(self.cfg["interfaccia"].get("tema", "azzurro"), TEMI["azzurro"])
+        )
         self._applica_tema()
         pad = {"padx": 8, "pady": 6}
 
@@ -1519,13 +1637,32 @@ class App(tk.Tk):
             side="left"
         )
         self.engine_label = ttk.Label(top, text="", foreground=COLORI["testo_tenue"])
-        self.engine_label.pack(side="right")
+        self.engine_label.pack(side="right", padx=(0, 10))
+
+        self.tema_var = tk.StringVar()
+        self.tema_box = ttk.Combobox(
+            top,
+            textvariable=self.tema_var,
+            state="readonly",
+            width=34,
+            values=[etichetta for etichetta, _ in TEMI_INTERFACCIA],
+        )
+        self.tema_box.pack(side="right")
+        self.tema_box.bind("<<ComboboxSelected>>", lambda _e: self._on_tema_changed())
+        ttk.Label(top, text="Aspetto").pack(side="right", padx=(0, 6))
+        tema_corrente = self.cfg["interfaccia"].get("tema", "azzurro")
+        self.tema_var.set(
+            next(
+                (e for e, v in TEMI_INTERFACCIA if v == tema_corrente),
+                TEMI_INTERFACCIA[0][0],
+            )
+        )
 
         meter_row = ttk.Frame(self)
         meter_row.pack(fill="x", **pad)
         ttk.Label(meter_row, text="Livello").pack(side="left")
         self.meter = tk.Canvas(
-            meter_row, height=20, bg=COLORI["blu_scuro"], highlightthickness=0
+            meter_row, height=20, bg=COLORI["vumetro"], highlightthickness=0
         )
         self.meter.pack(side="left", fill="x", expand=True, padx=8)
         self.clock_label = ttk.Label(meter_row, text="00:00:00", font=("Consolas", 11))
@@ -1630,9 +1767,9 @@ class App(tk.Tk):
             text_frame, wrap="word", font=("Segoe UI", 11), state="disabled",
             spacing1=2, spacing3=4, padx=10, pady=8,
             bg=COLORI["superficie"], fg=COLORI["testo"],
-            insertbackground=COLORI["blu"],
-            selectbackground=COLORI["blu_chiaro"],
-            selectforeground=COLORI["blu_scuro"],
+            insertbackground=COLORI["accento"],
+            selectbackground=COLORI["selezione"],
+            selectforeground=COLORI["accento_scuro"],
             relief="flat", highlightthickness=1,
             highlightbackground=COLORI["bordo"], highlightcolor=COLORI["bordo"],
         )
@@ -1644,7 +1781,7 @@ class App(tk.Tk):
             "ts", foreground=COLORI["testo_tenue"], font=("Consolas", 9)
         )
         self.text.tag_configure(
-            "note", foreground=COLORI["blu"], font=("Segoe UI", 11, "bold")
+            "note", foreground=COLORI["accento"], font=("Segoe UI", 11, "bold")
         )
         self.text.tag_configure(
             "meta", foreground=COLORI["testo_tenue"], font=("Segoe UI", 9, "italic")
