@@ -1232,6 +1232,8 @@ class App(tk.Tk):
         self.summarizer: LocalSummarizer | CloudSummarizer | AutoSummarizer | None = None
         self.model_ready = False
         self.generating_highlights = False
+        self._hl_inizio: float | None = None  # avvio dell'elaborazione, per il cronometro
+        self._hl_etichetta = ""
         self.state_name = "idle"  # idle | recording | paused | finishing
         self.peak = 0.0
 
@@ -1680,9 +1682,15 @@ class App(tk.Tk):
             self.status.config(text="Nessun testo da analizzare.")
             return
 
+        # Il riscontro va dove l'utente sta guardando. Su un verbale lungo col
+        # motore remoto l'attesa e' di minuti: con il solo testo nella barra di
+        # stato in fondo alla finestra sembra che il clic non abbia fatto nulla.
         self.generating_highlights = True
+        self._hl_inizio = time.monotonic()
+        self._hl_etichetta = "Scelgo il motore"
         self._refresh_buttons()
-        self.status.config(text="Scelgo il motore…")
+        self._append("\nGenero i punti salienti…\n", "meta")
+        self._tick_highlights()
 
         def work():
             try:
@@ -1705,12 +1713,41 @@ class App(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _tick_highlights(self) -> None:
+        """Cronometro che scorre finche' il motore sta elaborando.
+
+        Serve a distinguere "sta lavorando" da "non e' partito niente": senza
+        un numero che cambia, tre minuti di attesa sono indistinguibili da un
+        clic andato perso.
+        """
+        if not self.generating_highlights or self._hl_inizio is None:
+            return
+        trascorso = time.monotonic() - self._hl_inizio
+        puntini = "." * (1 + int(trascorso * 2) % 3)
+        self.status.config(
+            text=f"{self._hl_etichetta}{puntini}  {fmt_hms(trascorso)}  "
+            "(il pulsante torna attivo a elaborazione finita)"
+        )
+        self.after(400, self._tick_highlights)
+
     def _on_highlights_planned(self, etichetta: str, e_cloud: bool) -> None:
         prefisso = "CLOUD - " if e_cloud else ""
-        self.status.config(text=f"{prefisso}Punti salienti in corso: {etichetta}…")
+        self._hl_etichetta = f"{prefisso}{etichetta}"
+        # Anche nella finestra, non solo nella barra: se il testo sta per
+        # uscire dal PC deve vedersi dove l'utente sta leggendo.
+        self._append(f"{etichetta}\n", "cloud" if e_cloud else "meta")
+
+    def _durata_highlights(self) -> str:
+        """Quanto e' durata l'elaborazione, da aggiungere al messaggio finale."""
+        if self._hl_inizio is None:
+            return ""
+        durata = fmt_hms(time.monotonic() - self._hl_inizio)
+        self._hl_inizio = None
+        return f" in {durata}"
 
     def _on_highlights_ready(self, risultato: Highlights) -> None:
         self.generating_highlights = False
+        durata = self._durata_highlights()
         banner = risultato.banner()
 
         # Dopo la ripulitura puo' non restare niente: e' il caso di una
@@ -1720,7 +1757,9 @@ class App(tk.Tk):
             self._append("\nPunti salienti\n", "note")
             self._append(f"{banner}\n", "cloud" if risultato.is_cloud else "note")
             self._append("Nessun punto saliente individuato nel testo.\n\n", "meta")
-            self.status.config(text="Nessun punto saliente individuato.")
+            self.status.config(
+                text=f"Nessun punto saliente individuato{durata}."
+            )
             self._refresh_buttons()
             return
 
@@ -1742,14 +1781,18 @@ class App(tk.Tk):
             f" {quanti} nomi da controllare." if quanti else ""
         )
         self.status.config(
-            text=("Punti salienti generati nel CLOUD." if risultato.is_cloud
-                  else "Punti salienti generati in locale.") + coda
+            text=("Punti salienti generati nel CLOUD" if risultato.is_cloud
+                  else "Punti salienti generati in locale") + durata + "." + coda
         )
         self._refresh_buttons()
 
     def _on_highlights_failed(self, exc: Exception) -> None:
         self.generating_highlights = False
-        self.status.config(text=f"Punti salienti non generati: {exc}")
+        durata = self._durata_highlights()
+        self.status.config(text=f"Punti salienti non generati{durata}: {exc}")
+        # Anche nella finestra: chi guarda il testo deve capire che il "Genero…"
+        # di prima e' finito male, non che sta ancora lavorando.
+        self._append(f"Punti salienti non generati: {exc}\n\n", "cloud")
         messagebox.showerror("Punti salienti non riusciti", str(exc))
         self._refresh_buttons()
 
@@ -1874,8 +1917,11 @@ class App(tk.Tk):
         has_file = self.session is not None and self.session.transcript_path.exists()
         self.btn_copy.config(state="normal" if has_file else "disabled")
         self.btn_open.config(state="normal" if has_file else "disabled")
+        # L'etichetta del pulsante e' il riscontro piu' immediato: il controllo
+        # che hai premuto cambia da solo, senza dover cercare la barra di stato.
         self.btn_highlights.config(
-            state="normal" if (has_file and not self.generating_highlights) else "disabled"
+            text="Genero…" if self.generating_highlights else "Punti salienti",
+            state="normal" if (has_file and not self.generating_highlights) else "disabled",
         )
 
     def _on_close(self) -> None:
