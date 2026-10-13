@@ -8,12 +8,20 @@ faster-whisper>=1.0.3
 # Serve solo se in config.json imposti "engine": "cloud".
 requests>=2.31
 
-# Punti salienti, motore cloud. Serve se in config.json "summary.engine" e'
-# "cloud", oppure "auto" e la trascrizione supera la soglia di parole.
-# Richiede la variabile d'ambiente ANTHROPIC_API_KEY.
+# Punti salienti, motore remoto. Serve se in config.json "summary.engine" e'
+# "cloud", oppure "auto" e la trascrizione supera la soglia di parole. Quale dei
+# due venga usato dipende da "summary.cloud.provider".
+#
+# provider "gemini" (predefinito) — richiede GEMINI_API_KEY, chiave da
+# aistudio.google.com. Ha un piano gratuito, sul quale pero' Google usa i
+# contenuti per migliorare i propri prodotti.
+google-genai>=2.30
+
+# provider "anthropic" — richiede ANTHROPIC_API_KEY, a consumo.
 anthropic>=0.40
 
 # Punti salienti, motore locale: non e' un pacchetto Python. Va installato
-# Ollama (https://ollama.com) e scaricato il modello:
-#     ollama pull qwen2.5:3b
+# Ollama (https://ollama.com) e scaricato il modello indicato in
+# summary.local.model:
+#     ollama pull gemma3:4b
 # Il dialogo avviene via HTTP su localhost:11434, senza SDK aggiuntivi.

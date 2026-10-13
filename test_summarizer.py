@@ -9,6 +9,7 @@ Avvio:  python test_summarizer.py
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from unittest import mock
@@ -36,7 +37,17 @@ def test_configurazione() -> None:
     print("--- 1. la chiave summary sopravvive al merge con config.json ---")
     cfg = verbale.load_config()
     verifica("summary presente", "summary" in cfg)
-    verifica("engine predefinito = auto", cfg["summary"].get("engine") == "auto")
+    # Il predefinito si controlla su DEFAULT_CONFIG: nel config.json c'e' la
+    # preferenza scelta dalla tendina, che e' legittimamente diversa.
+    verifica(
+        "predefinito di fabbrica = auto",
+        verbale.DEFAULT_CONFIG["summary"]["engine"] == "auto",
+    )
+    scelto = cfg["summary"].get("engine")
+    verifica(
+        f"preferenza salvata ({scelto!r}) e' una voce valida del menu",
+        scelto in [v for _, v in verbale.MOTORI_SINTESI],
+    )
     verifica("soglia definita", cfg["summary"].get("soglia_parole", 0) > 0)
 
 
@@ -45,11 +56,198 @@ def test_fabbrica() -> None:
     base = verbale.load_config()["summary"]
     for motore, atteso in [
         ("local", verbale.LocalSummarizer),
-        ("cloud", verbale.CloudSummarizer),
+        ("cloud", verbale.RemoteSummarizer),
         ("auto", verbale.AutoSummarizer),
     ]:
         costruito = verbale.build_summarizer({"summary": dict(base, engine=motore)})
         verifica(f"engine={motore} -> {atteso.__name__}", isinstance(costruito, atteso))
+
+
+def test_fornitori_remoti() -> None:
+    print("\n--- 2b. la scelta del fornitore remoto ---")
+    cloud = verbale.load_config()["summary"]["cloud"]
+
+    verifica(
+        "gemini -> GeminiSummarizer",
+        isinstance(
+            verbale.build_cloud_summarizer(dict(cloud, provider="gemini")),
+            verbale.GeminiSummarizer,
+        ),
+    )
+    verifica(
+        "anthropic -> CloudSummarizer",
+        isinstance(
+            verbale.build_cloud_summarizer(dict(cloud, provider="anthropic")),
+            verbale.CloudSummarizer,
+        ),
+    )
+    verifica(
+        "entrambi sono motori remoti",
+        all(
+            issubclass(c, verbale.RemoteSummarizer)
+            for c in verbale.FORNITORI_REMOTI.values()
+        ),
+    )
+
+    # Un refuso nel config deve dare un errore che si legge, non un KeyError.
+    for rotto, atteso in [("gemnini", "sconosciuto"), ("", "sconosciuto")]:
+        try:
+            verbale.build_cloud_summarizer(dict(cloud, provider=rotto))
+            verifica(f"provider {rotto!r} rifiutato", False)
+        except RuntimeError as exc:
+            verifica(f"provider {rotto!r} rifiutato con spiegazione", atteso in str(exc))
+        except Exception as exc:
+            verifica(f"provider {rotto!r} -> RuntimeError, non {type(exc).__name__}", False)
+
+    # Sezione mancante: altrettanto esplicito.
+    try:
+        verbale.build_cloud_summarizer({"provider": "gemini"})
+        verifica("sezione mancante rifiutata", False)
+    except RuntimeError as exc:
+        verifica("sezione mancante segnalata", "summary.cloud.gemini" in str(exc))
+
+
+def test_richiesta_gemini() -> None:
+    print("\n--- 2c. la richiesta Gemini usa i nomi veri dell'SDK ---")
+    cfg = verbale.load_config()["summary"]["cloud"]["gemini"]
+    motore = verbale.GeminiSummarizer(cfg)
+
+    # La configurazione e' un dizionario, e ogni dettaglio qui sotto e' una
+    # lezione pagata con una chiamata rifiutata:
+    #
+    # 1. un types.GenerateContentConfig si costruiva benissimo e il test
+    #    passava, ma interactions.create lo rifiutava;
+    # 2. anche types.GenerationConfig veniva rifiutato — ne esiste una seconda
+    #    classe interna in _gaos, e la forma pubblica che funziona e' il dict;
+    # 3. thinking_level e' una chiave di primo livello, non dentro un
+    #    thinking_config;
+    # 4. il valore va minuscolo: 'LOW' torna 400 dal server.
+    conf = motore._configurazione()
+    verifica("la configurazione e' un dizionario", isinstance(conf, dict))
+    verifica(
+        "max_output_tokens presente",
+        conf.get("max_output_tokens") == cfg.get("max_tokens", 1024),
+    )
+    verifica("nessun thinking_config annidato", "thinking_config" not in conf)
+    livello = conf.get("thinking_level")
+    verifica("thinking_level di primo livello", livello is not None)
+    verifica(
+        "thinking_level minuscolo e fra i valori del protocollo",
+        livello in {"minimal", "low", "medium", "high"},
+    )
+    verifica("temperature non passata (deprecata)", "temperature" not in conf)
+
+    # Anche in maiuscolo nel config, deve uscire minuscolo.
+    urlante = verbale.GeminiSummarizer(dict(cfg, thinking_level="LOW"))
+    verifica(
+        "un 'LOW' nel config viene normalizzato",
+        urlante._configurazione().get("thinking_level") == "low",
+    )
+
+    # I guasti temporanei vanno distinti da quelli definitivi.
+    verifica(
+        "503 riconosciuto come temporaneo",
+        verbale.GeminiSummarizer._e_temporaneo(Exception("Error code: 503 service_unavailable")),
+    )
+    verifica(
+        "chiave sbagliata NON e' temporanea",
+        not verbale.GeminiSummarizer._e_temporaneo(Exception("API key not valid")),
+    )
+
+    verifica(
+        "available() segue la variabile d'ambiente",
+        motore.available()
+        == bool(os.environ.get(cfg["api_key_env"], "").strip()),
+    )
+    verifica(
+        "il piano gratuito e' dichiarato nell'etichetta",
+        "piano gratuito" in motore._etichetta(),
+    )
+    verifica("plan() dichiara che e' remoto", motore.plan("ciao")[1] is True)
+
+    print("   errori tradotti in italiano leggibile:")
+    casi = [
+        ("429 RESOURCE_EXHAUSTED: quota exceeded", "Limite del piano Gemini"),
+        ("API key not valid. Please pass a valid API key.", "Chiave Gemini rifiutata"),
+        ("403 PERMISSION_DENIED", "Chiave Gemini rifiutata"),
+        ("connessione interrotta", "Gemini non ha risposto"),
+    ]
+    for grezzo, atteso in casi:
+        tradotto = verbale.GeminiSummarizer._traduci_errore(Exception(grezzo))
+        verifica(f"{grezzo[:34]!r}", atteso in tradotto)
+
+    print("   estrazione del testo dalla risposta:")
+
+    class _Blocco:
+        def __init__(self, testo):
+            self.text = testo
+
+    class _Passo:
+        def __init__(self, testi):
+            self.content = [_Blocco(t) for t in testi]
+
+    class _Diretta:
+        output_text = "Decisioni\n- rinnovo approvato"
+
+    class _APassi:
+        output_text = ""
+        steps = [_Passo(["Azioni\n", "- mandare la mail"])]
+
+    class _Vuota:
+        output_text = ""
+        steps = []
+
+    verifica("output_text usato quando c'e'", "rinnovo" in verbale._testo_gemini(_Diretta()))
+    verifica("ripiego sui passi quando manca", "mail" in verbale._testo_gemini(_APassi()))
+    verifica("risposta vuota -> stringa vuota", verbale._testo_gemini(_Vuota()) == "")
+
+
+def test_disponibilita_locale() -> None:
+    print("\n--- 2d. available() guarda il modello, non solo il server ---")
+    import io
+    import json as _json
+
+    class _Risposta(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _finto_urlopen(corpo):
+        def _apri(url, timeout=None):
+            return _Risposta(_json.dumps(corpo).encode())
+
+        return _apri
+
+    originale = verbale.urllib.request.urlopen
+    try:
+        elencati = {"models": [{"name": "gemma3:latest"}, {"name": "altro:7b"}]}
+        verbale.urllib.request.urlopen = _finto_urlopen(elencati)
+        verifica(
+            "'gemma3' combacia con 'gemma3:latest'",
+            verbale.LocalSummarizer({"model": "gemma3"}).available(),
+        )
+        verifica(
+            "'gemma3:latest' combacia",
+            verbale.LocalSummarizer({"model": "gemma3:latest"}).available(),
+        )
+        verifica(
+            "'gemma3:4b' non combacia con 'gemma3:latest'",
+            not verbale.LocalSummarizer({"model": "gemma3:4b"}).available(),
+        )
+
+        # Il caso che ha motivato la modifica: Ollama risponde, lista vuota.
+        verbale.urllib.request.urlopen = _finto_urlopen({"models": []})
+        vuoto = verbale.LocalSummarizer({"model": "gemma3:4b"})
+        verifica("server attivo ma senza modelli -> non disponibile", not vuoto.available())
+        verifica("lista vuota -> insieme vuoto", vuoto.modelli_disponibili() == set())
+    finally:
+        verbale.urllib.request.urlopen = originale
+
+    morto = verbale.LocalSummarizer({"model": "x", "host": "http://127.0.0.1:1"})
+    verifica("host irraggiungibile -> non disponibile", not morto.available())
+    verifica("host irraggiungibile -> insieme vuoto", morto.modelli_disponibili() == set())
 
 
 def test_blocchi() -> None:
@@ -94,7 +292,7 @@ def test_voci_menu() -> None:
     attesi = {
         "auto": verbale.AutoSummarizer,
         "local": verbale.LocalSummarizer,
-        "cloud": verbale.CloudSummarizer,
+        "cloud": verbale.RemoteSummarizer,
     }
     for valore in valori:
         costruito = verbale.build_summarizer({"summary": dict(base, engine=valore)})
@@ -186,7 +384,10 @@ def test_banner() -> None:
 
 def test_scelta() -> None:
     print("\n--- 6. scelta automatica in base alla lunghezza ---")
-    auto = verbale.build_summarizer(verbale.load_config())
+    # Costruito a mano, non via build_summarizer: quello segue la preferenza
+    # salvata dalla tendina, che l'utente puo' avere messo su "local" o
+    # "cloud". Il test della scelta automatica deve provare l'automatico.
+    auto = verbale.AutoSummarizer(verbale.load_config()["summary"])
     ollama_ok = auto.local.available()
     cloud_ok = auto.cloud.available()
     print(f"   (Ollama: {ollama_ok}, chiave cloud: {cloud_ok})")
@@ -211,6 +412,9 @@ def test_scelta() -> None:
 def main() -> int:
     test_configurazione()
     test_fabbrica()
+    test_fornitori_remoti()
+    test_richiesta_gemini()
+    test_disponibilita_locale()
     test_blocchi()
     test_voci_menu()
     test_pulizia()

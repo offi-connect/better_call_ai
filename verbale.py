@@ -87,9 +87,27 @@ DEFAULT_CONFIG = {
             "parole_per_blocco": 550,
         },
         "cloud": {
-            "model": "claude-haiku-4-5-20251001",
-            "api_key_env": "ANTHROPIC_API_KEY",
-            "max_tokens": 1024,
+            # Quale servizio remoto usare. La tendina dell'interfaccia resta a
+            # tre posizioni (auto/locale/remoto): il fornitore si scegli qui.
+            "provider": "gemini",  # "gemini" | "anthropic"
+            "gemini": {
+                "model": "gemini-3.5-flash-lite",
+                "api_key_env": "GEMINI_API_KEY",
+                "max_tokens": 1024,
+                # L'estrazione dei punti salienti non ha bisogno di ragionare a
+                # lungo, e sui modelli Gemini il ragionamento consuma token di
+                # uscita: tenerlo basso costa meno senza perdere qualita'.
+                "thinking_level": "low",
+                # Sul piano gratuito Google usa i contenuti per migliorare i
+                # propri prodotti; su quello a pagamento no. Se sei sul piano
+                # gratuito lascia True e il banner lo dichiarera'.
+                "piano_gratuito": True,
+            },
+            "anthropic": {
+                "model": "claude-haiku-4-5-20251001",
+                "api_key_env": "ANTHROPIC_API_KEY",
+                "max_tokens": 1024,
+            },
         },
     },
     "output_dir": "sessioni",
@@ -337,6 +355,10 @@ SUMMARY_SYSTEM_PROMPT = (
     "scrivi solo l'azione e basta.\n"
     "- Conserva numeri, date, giorni della settimana, importi e nomi esattamente "
     "come compaiono: se il testo dice martedi' non scrivere mercoledi'.\n"
+    "- Non introdurre nomi propri che non siano nella trascrizione: niente nomi "
+    "di aziende, prodotti, servizi o fornitori che tu abbia dedotto o "
+    "completato. Se la trascrizione e' confusa o tronca, riporta le parole che "
+    "ci sono anche se incomplete, senza ricostruire il nome che immagini.\n"
     "- Scrivi in italiano corretto. Non inventare parole.\n"
     "- Se una sezione non ha contenuti, ometti del tutto la sezione.\n"
     "- Non scrivere mai una voce che commenta l'assenza di contenuto.\n\n"
@@ -492,7 +514,163 @@ class Highlights:
         return f"[LOCALE] Elaborato da {self.detail} - nessun dato ha lasciato questo PC"
 
 
-class CloudSummarizer:
+class RemoteSummarizer:
+    """Base comune ai motori remoti.
+
+    Esiste per i controlli di tipo: il codice e i test devono poter chiedere
+    "questo motore manda il testo fuori dal PC?" senza elencare i fornitori.
+    """
+
+
+def _testo_gemini(interazione) -> str:
+    """Estrae il testo dalla risposta di Gemini.
+
+    output_text e' la via diretta, ma per contratto restituisce solo gli ultimi
+    blocchi di testo e salta quelli separati da contenuti non testuali (pensieri,
+    chiamate a strumenti). Se torna vuoto si ricompone a mano dai passi.
+    """
+    diretto = getattr(interazione, "output_text", None)
+    if diretto:
+        return diretto
+    pezzi: list[str] = []
+    for passo in getattr(interazione, "steps", None) or []:
+        for blocco in getattr(passo, "content", None) or []:
+            testo = getattr(blocco, "text", None)
+            if testo:
+                pezzi.append(testo)
+    return "".join(pezzi)
+
+
+class GeminiSummarizer(RemoteSummarizer):
+    """Manda il verbale all'API Gemini di Google."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.model = cfg.get("model", "gemini-3.5-flash-lite")
+        self._client = None
+
+    def _key_env(self) -> str:
+        return self.cfg.get("api_key_env", "GEMINI_API_KEY")
+
+    def available(self) -> bool:
+        return bool(os.environ.get(self._key_env(), "").strip())
+
+    def _client_ready(self):
+        if self._client is None:
+            from google import genai
+
+            api_key = os.environ.get(self._key_env(), "").strip()
+            if not api_key:
+                raise RuntimeError(
+                    f"Variabile d'ambiente {self._key_env()} non impostata."
+                )
+            self._client = genai.Client(api_key=api_key)
+        return self._client
+
+    def _etichetta(self) -> str:
+        """Sul piano gratuito l'avviso fa parte dell'identita' del motore."""
+        if self.cfg.get("piano_gratuito", False):
+            return (
+                f"{self.model} (piano gratuito: Google puo' usare il testo "
+                "per addestrare i suoi modelli)"
+            )
+        return self.model
+
+    def _configurazione(self) -> dict:
+        """Il dizionario che interactions.create si aspetta.
+
+        Un dizionario e non un oggetto tipizzato, per tre motivi verificati
+        contro l'SDK installato:
+
+        - ne esistono DUE di GenerationConfig. Quello pubblico in
+          google.genai.types viene rifiutato: l'unmarshaller vuole la sua
+          classe interna in _gaos, che e' privata e non va importata. Il
+          dizionario e' l'unica forma pubblica che accetta.
+        - thinking_level e' una chiave di primo livello, non annidata dentro
+          un thinking_config come nell'altra API.
+        - temperature esiste ma e' marcata deprecata, quindi non la passiamo:
+          a tenere il formato ci pensano il prompt e pulisci_elenco().
+
+        thinking_level va in minuscolo: l'enum Python dell'SDK ha i nomi in
+        maiuscolo, ma il protocollo accetta solo 'minimal', 'low', 'medium',
+        'high' e un 'LOW' viene respinto con 400.
+        """
+        opzioni: dict = {"max_output_tokens": self.cfg.get("max_tokens", 1024)}
+        livello = self.cfg.get("thinking_level")
+        if livello:
+            opzioni["thinking_level"] = str(livello).strip().lower()
+        return opzioni
+
+    def plan(self, transcript_text: str) -> tuple[str, bool]:
+        return f"invio a Gemini ({self._etichetta()})", True
+
+    def summarize(self, transcript_text: str) -> Highlights:
+        """Chiede i punti salienti, riprovando sui guasti dichiarati temporanei.
+
+        Il 503 "high demand" capita e passa da solo: senza un riprova, un
+        verbale lungo andrebbe perso per un singolo picco di traffico.
+        """
+        client = self._client_ready()
+        tentativi = max(1, int(self.cfg.get("tentativi", 3)))
+        attesa = 4.0
+        ultimo: Exception | None = None
+
+        for numero in range(1, tentativi + 1):
+            try:
+                interazione = client.interactions.create(
+                    model=self.model,
+                    input=transcript_text,
+                    system_instruction=SUMMARY_SYSTEM_PROMPT,
+                    generation_config=self._configurazione(),
+                )
+                testo = pulisci_elenco(_testo_gemini(interazione))
+                return Highlights(testo, "cloud", self._etichetta())
+            except Exception as exc:
+                ultimo = exc
+                if numero < tentativi and self._e_temporaneo(exc):
+                    time.sleep(attesa)
+                    attesa *= 2
+                    continue
+                raise RuntimeError(self._traduci_errore(exc)) from exc
+
+        raise RuntimeError(self._traduci_errore(ultimo or Exception("ignoto")))
+
+    @staticmethod
+    def _e_temporaneo(exc: Exception) -> bool:
+        """Vale la pena riprovare? Solo per i guasti che passano da soli."""
+        basso = str(exc).lower()
+        return (
+            "503" in basso
+            or "service_unavailable" in basso
+            or "high demand" in basso
+            or "overloaded" in basso
+            or "unavailable" in basso
+        )
+
+    @staticmethod
+    def _traduci_errore(exc: Exception) -> str:
+        """Il piano gratuito ha limiti di frequenza: devono leggersi, non esplodere."""
+        messaggio = str(exc)
+        basso = messaggio.lower()
+        if "429" in messaggio or "resource_exhausted" in basso or "quota" in basso:
+            return (
+                "Limite del piano Gemini raggiunto. Riprova piu' tardi, oppure "
+                "scegli il modello locale dalla tendina."
+            )
+        if GeminiSummarizer._e_temporaneo(exc):
+            return (
+                "Gemini e' sovraccarico in questo momento (503). Ho riprovato "
+                "senza successo: ritenta fra qualche minuto, oppure scegli il "
+                "modello locale dalla tendina."
+            )
+        if any(
+            s in basso for s in ("api key", "unauthenticated", "permission_denied")
+        ) or any(c in messaggio for c in ("401", "403")):
+            return "Chiave Gemini rifiutata: controlla GEMINI_API_KEY."
+        return f"Gemini non ha risposto: {messaggio}"
+
+
+class CloudSummarizer(RemoteSummarizer):
     """Manda il verbale all'API Claude. Veloce, ma il testo esce dal PC."""
 
     def __init__(self, cfg: dict):
@@ -542,15 +720,37 @@ class LocalSummarizer:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.model = cfg.get("model", "qwen2.5:3b")
+        self.model = cfg.get("model", "gemma3:4b")
         self.host = cfg.get("host", "http://127.0.0.1:11434").rstrip("/")
 
     def available(self) -> bool:
+        """Ollama attivo E il modello configurato presente.
+
+        Controllare solo che il server risponda non basta: dopo una
+        reinstallazione di Ollama il server c'e' ma la lista dei modelli e'
+        vuota. L'indicatore direbbe "pronto" e il pulsante fallirebbe poi in
+        fase di generazione, che e' il momento peggiore per scoprirlo.
+        """
+        return self.model in self.modelli_disponibili()
+
+    def modelli_disponibili(self) -> set[str]:
+        """I modelli che Ollama ha davvero, insieme vuoto se non risponde."""
         try:
-            with urllib.request.urlopen(f"{self.host}/api/tags", timeout=2):
-                return True
+            with urllib.request.urlopen(f"{self.host}/api/tags", timeout=2) as resp:
+                dati = json.load(resp)
         except Exception:
-            return False
+            return set()
+        nomi: set[str] = set()
+        for voce in dati.get("models") or []:
+            nome = voce.get("name") or voce.get("model") or ""
+            if not nome:
+                continue
+            nomi.add(nome)
+            # Ollama elenca "gemma3:4b" e "nomic-embed-text:latest": una
+            # configurazione senza tag deve combaciare con ":latest".
+            if nome.endswith(":latest"):
+                nomi.add(nome[: -len(":latest")])
+        return nomi
 
     def _ask(self, system: str, prompt: str, num_ctx: int) -> str:
         payload = json.dumps(
@@ -642,7 +842,7 @@ class AutoSummarizer:
     def __init__(self, cfg: dict):
         self.soglia = cfg.get("soglia_parole", 700)
         self.local = LocalSummarizer(cfg["local"])
-        self.cloud = CloudSummarizer(cfg["cloud"])
+        self.cloud = build_cloud_summarizer(cfg["cloud"])
 
     def _scegli(self, transcript_text: str):
         """Restituisce (motore, e_un_ripiego)."""
@@ -655,8 +855,10 @@ class AutoSummarizer:
         if ripiego.available():
             return ripiego, True
         raise RuntimeError(
-            "Nessun motore disponibile: Ollama non risponde e la chiave "
-            "dell'API cloud non e' impostata."
+            f"Nessun motore disponibile. Il locale richiede Ollama attivo con "
+            f"il modello {self.local.model} (scaricalo con "
+            f"'ollama pull {self.local.model}'); il remoto richiede la chiave "
+            "API nella variabile d'ambiente."
         )
 
     def plan(self, transcript_text: str) -> tuple[str, bool]:
@@ -675,11 +877,35 @@ class AutoSummarizer:
 
 
 # Voci del menu a tendina: (etichetta mostrata, valore in config.json).
+# Restano tre: "remoto" e' remoto a prescindere dal fornitore, che si scegli con
+# summary.cloud.provider in config.json.
 MOTORI_SINTESI = [
-    ("Automatico (locale se corto, cloud se lungo)", "auto"),
+    ("Automatico (locale se corto, remoto se lungo)", "auto"),
     ("Solo modello locale (niente esce dal PC)", "local"),
-    ("Solo modello remoto (Claude, a pagamento)", "cloud"),
+    ("Solo modello remoto (servizio esterno)", "cloud"),
 ]
+
+FORNITORI_REMOTI = {
+    "gemini": GeminiSummarizer,
+    "anthropic": CloudSummarizer,
+}
+
+
+def build_cloud_summarizer(cloud_cfg: dict) -> RemoteSummarizer:
+    """Costruisce il motore remoto indicato da summary.cloud.provider."""
+    provider = cloud_cfg.get("provider", "gemini")
+    classe = FORNITORI_REMOTI.get(provider)
+    if classe is None:
+        ammessi = ", ".join(sorted(FORNITORI_REMOTI))
+        raise RuntimeError(
+            f"Fornitore remoto sconosciuto in config.json: {provider!r}. "
+            f"Ammessi: {ammessi}."
+        )
+    if provider not in cloud_cfg:
+        raise RuntimeError(
+            f"Manca la sezione summary.cloud.{provider} in config.json."
+        )
+    return classe(cloud_cfg[provider])
 
 
 def build_summarizer(cfg: dict):
@@ -688,7 +914,7 @@ def build_summarizer(cfg: dict):
     if engine == "local":
         return LocalSummarizer(summary["local"])
     if engine == "cloud":
-        return CloudSummarizer(summary["cloud"])
+        return build_cloud_summarizer(summary["cloud"])
     return AutoSummarizer(summary)
 
 
@@ -1311,23 +1537,37 @@ class App(tk.Tk):
         summary = dict(self.cfg["summary"])
 
         def work():
-            locale = LocalSummarizer(summary["local"]).available()
-            cloud = CloudSummarizer(summary["cloud"]).available()
+            motore_locale = LocalSummarizer(summary["local"])
+            modelli = motore_locale.modelli_disponibili()
+            locale = motore_locale.model in modelli
+            # Distinguere i due guasti del locale: Ollama spento, oppure attivo
+            # ma senza il modello configurato. Le soluzioni sono diverse.
+            if locale:
+                guasto_locale = ""
+            elif modelli:
+                guasto_locale = f"manca il modello {motore_locale.model}"
+            else:
+                guasto_locale = "Ollama non risponde"
+
+            try:
+                motore_remoto = build_cloud_summarizer(summary["cloud"])
+                cloud = motore_remoto.available()
+                guasto_remoto = "" if cloud else "chiave API non impostata"
+            except RuntimeError as exc:
+                cloud, guasto_remoto = False, str(exc)
+
             if scelto == "local":
-                esito = ("pronto", True) if locale else ("Ollama non risponde", False)
+                esito = ("pronto", True) if locale else (guasto_locale, False)
             elif scelto == "cloud":
-                esito = (
-                    ("pronto", True) if cloud
-                    else ("chiave API non impostata", False)
-                )
+                esito = ("pronto", True) if cloud else (guasto_remoto, False)
             elif locale and cloud:
                 esito = ("entrambi disponibili", True)
             elif locale:
-                esito = ("solo locale: manca la chiave API", False)
+                esito = (f"solo locale: {guasto_remoto}", False)
             elif cloud:
-                esito = ("solo cloud: Ollama non risponde", False)
+                esito = (f"solo remoto: {guasto_locale}", False)
             else:
-                esito = ("nessun motore disponibile", False)
+                esito = (f"nessun motore: {guasto_locale}, {guasto_remoto}", False)
             self.after(0, lambda: self._mostra_stato_motore(*esito))
 
         threading.Thread(target=work, daemon=True).start()
