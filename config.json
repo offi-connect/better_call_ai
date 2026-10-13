@@ -27,5 +27,8 @@
     "noise_multiplier": 3.0,
     "absolute_floor": 0.004
   },
-  "output_dir": "sessioni"
+  "output_dir": "sessioni",
+  "summary": {
+    "engine": "cloud"
+  }
 }
